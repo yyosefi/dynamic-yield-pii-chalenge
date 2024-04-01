@@ -1,0 +1,78 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Quality Checks
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    paths:
+      - .pre-commit-config.yaml
+defaults:
+  run:
+    shell: bash -Eeuo pipefail -x {0}
+jobs:
+  quality-checks:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633 # v4.1.2
+        with:
+          fetch-depth: 0
+      - name: Compute Pre-commit arguments
+        id: pre-commit
+        shell: bash -Eeuo pipefail -x {0}
+        run: |
+          echo "event name: ${{ github.event_name }}"
+          # base_sha=${{ github.base_ref || 'null' }}
+          # head_sha=${{ github.head_ref || 'null' }}
+          base_sha=null
+          head_sha=null
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            base_sha=${{ github.event.pull_request.base.sha }}
+            head_sha=${{ github.event.pull_request.head.sha }}
+          elif [ "${{ github.event_name }}" == "merge_group" ]; then
+            base_sha=${{ github.event.merge_group.base_sha }}
+            head_sha=${{ github.event.merge_group.head_sha }}
+          fi
+          echo "base_sha: $base_sha"
+          echo "head_sha: $head_sha"
+
+          if [ "${{ github.ref_name }}" == "master" ]; then
+            echo "pre-commit on master"
+            EXTRA_ARGS="--all-files"
+          elif ! git diff $base_sha...$head_sha --no-rename --diff-filter=AMD --quiet -- .pre-commit-config.yaml .prettierrc.yaml .yamllint.yaml .markdownlint.yaml .hadolint.yaml; then
+            echo "pre-commit files changed"
+            EXTRA_ARGS="--all-files"
+          else
+            EXTRA_ARGS="--from-ref $base_sha --to-ref $head_sha"
+          fi
+          echo "extra_args=$EXTRA_ARGS" >>"$GITHUB_OUTPUT"
+      - name: Pre-commit
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: ${{ steps.pre-commit.outputs.extra_args }}
+        env:
+          SKIP: ${{ github.ref_name == 'main' && 'no-commit-to-branch' || '' }}
+      - name: CODEOWNERS validator
+        uses: mszostok/codeowners-validator@7f3f5e28c6d7b8dfae5731e54ce2272ca384592f # v0.7.4
+        with:
+          checks: files,duppatterns,syntax # ,owners
+          # owner_checker_owners_must_be_teams: true
+          experimental_checks: avoid-shadowing # ,notowned
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: GitLeaks
+        run: pre-commit run gitleaks-ci --hook-stage manual
+      - name: Auto approve and merge RenovateBot and DependaBot PRs
+        if: ${{ github.ref_name != 'main' && env.AUTOBOTS_TRANSFORM == 'true' && (github.actor == 'dependabot[bot]' || github.actor == 'renovate[bot]') }}
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_SEM_REL }}
+          AUTOBOTS_TRANSFORM: true
+        run: |
+          gh pr review "$PR_URL" --approve
+          gh pr merge --auto --squash --delete-branch "$PR_URL"
